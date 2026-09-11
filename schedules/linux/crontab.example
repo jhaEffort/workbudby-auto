@@ -1,0 +1,14 @@
+# WorkBuddy 自动日常 · cron 示例（Linux；macOS 也可用 cron）
+# 用法：先替换下面 3 个占位符，再 `crontab -e` 把内容粘贴进去。
+#
+#   __PYTHON__    = python3 绝对路径（终端执行 which python3 查看）
+#   __SKILL_DIR__ = 技能解压目录（内含 scripts/auto_daily.py）
+#   __WORK_DIR__  = 放 tokens.txt 的目录（脚本会 cd 进去再运行，否则读不到 token）
+#
+# 注意：先 mkdir -p __WORK_DIR__/logs ，否则日志重定向会失败。
+
+# 每天 09:30 早晨例行：签到 + 领取上次奖励 + 派猫出发 + 查积分
+30 9 * * * cd __WORK_DIR__ && __PYTHON__ __SKILL_DIR__/scripts/auto_daily.py >> __WORK_DIR__/logs/morning.log 2>&1
+
+# 每天 14:00 下午领奖：领取上午派出的猫带回来的奖励
+0 14 * * * cd __WORK_DIR__ && __PYTHON__ __SKILL_DIR__/scripts/auto_daily.py --afternoon >> __WORK_DIR__/logs/afternoon.log 2>&1

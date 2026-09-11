@@ -1,0 +1,10 @@
+# tokens.txt 示例（仅格式参考，不要填真实 token 进来提交/分享）
+# 规则：WB_TOKEN_n = 你的 token；上一行 # 开头写你自己的账号标签
+# 支持任意多个账号，按顺序 WB_TOKEN_1 / 2 / 3 ... 排列
+# 注意：本文件只作模板，使用前请替换成【你自己的】accessToken
+
+# WB_TOKEN_1 = 我的主账号
+WB_TOKEN_1=在此粘贴你自己的accessToken
+
+# WB_TOKEN_2 = 我的小号
+WB_TOKEN_2=在此粘贴你自己的另一个accessToken

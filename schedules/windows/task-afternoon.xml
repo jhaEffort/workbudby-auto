@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<!-- WorkBuddy 自动日常 · 下午领奖任务（14:00）
+     用法：替换 __PYTHON__ / __SKILL_DIR__ / __WORK_DIR__ 三个占位符后，
+           命令行执行：schtasks /create /tn "WorkBuddyCheckinAfternoon" /xml "task-afternoon.xml"
+     与早晨任务的区别仅在参数 --afternoon（领奖，不重复签到）
+-->
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>2026-01-01T14:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByDay>
+        <DaysInterval>1</DaysInterval>
+      </ScheduleByDay>
+    </CalendarTrigger>
+  </Triggers>
+  <Actions Context="Author">
+    <Exec>
+      <Command>__PYTHON__</Command>
+      <Arguments>__SKILL_DIR__\scripts\auto_daily.py --afternoon</Arguments>
+      <WorkingDirectory>__WORK_DIR__</WorkingDirectory>
+    </Exec>
+  </Actions>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+  </Settings>
+</Task>

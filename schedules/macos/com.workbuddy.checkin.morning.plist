@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.workbuddy.checkin.morning</string>
+
+    <!-- 替换占位符：__PYTHON__ / __SKILL_DIR__ / __WORK_DIR__ -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>__SKILL_DIR__/scripts/auto_daily.py</string>
+    </array>
+
+    <!-- 必须切到放 tokens.txt 的目录，否则读不到 token -->
+    <key>WorkingDirectory</key>
+    <string>__WORK_DIR__</string>
+
+    <!-- 每天 09:30 运行：签到 + 领旧奖 + 派猫 + 查积分 -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__WORK_DIR__/logs/morning.log</string>
+    <key>StandardErrorPath</key>
+    <string>__WORK_DIR__/logs/morning.err</string>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
