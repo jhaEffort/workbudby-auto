@@ -144,7 +144,7 @@ python3 scripts/auto_daily.py --account 小号
   **脚本已内置 `--chat` 用 ACP 协议直写云端会话来补这件事**（见下「连续登录对话打卡（ACP）」一节）。
   原理：增长中心后端只对当日产生真实对话的账号自动 +1，没有任何可程序化打卡的 RPC；`--chat` 走 ACP（StreamableHTTP + SSE + JSON-RPC `prompt`）往该账号某个云端会话发一句打卡话，等价于当天产生了一次对话。
   - **实测三账号链路均通**：`GET /console/as/conversations/{cid}/session` 换 ACP 专用 JWT → `GET {link}(SSE)` 取响应头 `Acp-Connection-Id` → `POST {link}` 发 `initialize`/`notifications/initialized`/`prompt` 三步 JSON-RPC（均 202 Accepted）。
-  - **⚠️ 是否计入连续登录仍需你次日核对**：早期为「待验证」项。5377 / 5728 在客户端**没有**每日对话 Automation，所以它们是干净验证样本——打卡次日打开增长中心看「当前连续登录」是否 +1 即可确认。
+  - **⚠️ 是否计入连续登录仍需你次日核对**：早期为「待验证」项。部分账号在客户端**没有**每日对话 Automation，所以它们是干净验证样本——打卡次日打开增长中心看「当前连续登录」是否 +1 即可确认。
   - **副作用（轻微）**：会在该账号某个云端会话里多一条「早安，今日连续登录打卡完成（WorkBuddy 自动脚本）」消息。创建专用空白打卡会话的 API 未开放，只能复用现有会话；挑选优先级：`name=="new conversation"` > 最近创建 > 第一个。
   - 若某账号**从未在客户端发起过任何对话**（云端会话列表为空），`--chat` 会跳过该账号并提示「无云端会话，ACP 对话打卡不可用」——此时先去客户端随便聊一句即可。
 - **`travel/status` 不可靠，别用它判断"有没有待领"**：status 返回的是最近一条旅行记录，`state=arrived` + `letter` 有内容**不代表还没领**（实测领取后仍显示 arrived/letter）。
