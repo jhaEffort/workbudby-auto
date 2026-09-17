@@ -16,6 +16,7 @@
   python3 auto_daily.py --afternoon   # 下午领奖（上午派出的猫回来了）
   python3 auto_daily.py --query       # 只查积分
   python3 auto_daily.py --usage       # 查积分使用概况（额度/已用/剩余/临近失效）
+  python3 auto_daily.py --chat        # 连续登录对话打卡（ACP 直写云端会话，三账号统一）
   python3 auto_daily.py --list        # 列出已配置的账号（含序号与标签）
   python3 auto_daily.py --account 2   # 只处理第 2 个账号（按序号）
   python3 auto_daily.py --account 1234   # 只处理标签里含 1234 的账号（按关键字切换）
@@ -29,7 +30,16 @@
 
 说明：
   - 每个账号独立处理，互不影响；某个账号 token 失效只会单独报错，不中断其他账号。
-  - 「连续登录」的对话打卡是另一回事（需真实对话/ACP），本脚本只做积分签到 + 喵旅行。
+  - 「连续登录」的对话打卡是另一回事（需真实对话/ACP），用独立的 --chat 子命令做。
+
+--chat 说明（连续登录对话打卡）：
+  增长中心「连续登录」没有可程序化打卡的接口，后端只对当日产生「真实对话」的账号自动 +1。
+  本模式用 ACP 协议（StreamableHTTP + SSE + JSON-RPC prompt）直写该账号的云端会话：
+    1) GET /console/as/conversations/{cid}/session  换 ACP 专用 JWT + worker link + sessionId
+    2) GET {link}(SSE) 从响应头取 Acp-Connection-Id
+    3) POST {link} 发 initialize / notifications/initialized / prompt 三步（均 202）
+  实测三账号均可用，但「是否计入连续登录」需次日打开增长中心核对（早期为待验证项）。
+  副作用：会在该账号某个云端会话里多一条打卡消息（复用现有会话，创建专用会话的 API 未开放）。
 """
 import json
 import sys
@@ -84,6 +94,110 @@ def api(url: str, token: str, method: str = "GET", body=None) -> dict:
     except Exception as e:
         log(f"请求失败: {e}")
         return {"_error": str(e)}
+
+
+# ─── 连续登录对话打卡（ACP 协议直写云端会话，不依赖客户端在线）────────────
+# 增长中心「连续登录」没有可程序化打卡的接口，后端只对当日产生「真实对话」的账号自动 +1。
+# 唯一的纯服务端路径是 ACP（StreamableHTTP + SSE + JSON-RPC prompt）：
+#   1) GET /console/as/conversations/{cid}/session  -> 换 ACP 专用 JWT + worker link + sessionId
+#   2) GET {link}(SSE) 取响应头 Acp-Connection-Id
+#   3) POST {link} 发 initialize / notifications/initialized / prompt 三步 JSON-RPC（均 202）
+# 注意：复用现有云端会话（创建专用会话的 API 未开放），会在该会话里多一条打卡消息。
+ACP_HOST = "https://workbuddy.cn"
+CONV_LIST = f"{ACP_HOST}/console/as/conversations/"
+
+
+def acp_sse_get(link: str, acp_token: str) -> str:
+    """GET link(SSE)，从响应头取 Acp-Connection-Id。不读 body。"""
+    req = urllib.request.Request(link, headers={
+        "Authorization": f"Bearer {acp_token}",
+        "Accept": "text/event-stream",
+        "User-Agent": "WorkBuddy-Desktop",
+    }, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            cid = resp.headers.get("Acp-Connection-Id")
+            try:
+                resp.read(1)
+            except Exception:
+                pass
+            return cid or ""
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            log("ACP: token 失效(401)，请刷新 accessToken")
+        else:
+            log(f"ACP SSE GET HTTP {e.code}")
+        return ""
+    except Exception as e:
+        log(f"ACP SSE GET 失败: {e}")
+        return ""
+
+
+def acp_post(link: str, acp_token: str, conn_id: str, payload: dict) -> bool:
+    req = urllib.request.Request(link, headers={
+        "Authorization": f"Bearer {acp_token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "Acp-Connection-Id": conn_id or "",
+        "User-Agent": "WorkBuddy-Desktop",
+    }, data=json.dumps(payload).encode(), method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            return resp.status in (200, 202)
+    except urllib.error.HTTPError as e:
+        log(f"ACP POST {payload.get('method')} HTTP {e.code}: {e.read().decode(errors='replace')[:200]}")
+        return False
+    except Exception as e:
+        log(f"ACP POST {payload.get('method')} 失败: {e}")
+        return False
+
+
+def pick_conversation(token: str):
+    """列出云端会话，挑一个写入打卡消息：优先 'new conversation'，否则最近创建，否则第一个。"""
+    r = api(CONV_LIST, token)
+    if "_error" in r:
+        return None
+    convs = (r.get("data") or {}).get("conversations", [])
+    if not convs:
+        return None
+    target = next((c for c in convs if c.get("name") == "new conversation"), None)
+    if target is None:
+        target = max(convs, key=lambda c: c.get("createdAt", 0)) or convs[0]
+    return target
+
+
+def chat_checkin_one(token: str, label: str = "") -> bool:
+    """对一个账号做 ACP 对话打卡，返回是否成功发出 prompt。"""
+    conv = pick_conversation(token)
+    if not conv:
+        log(f"{label} 无云端会话，ACP 对话打卡不可用（需先在客户端发起过一次对话）")
+        return False
+    cid = conv.get("id")
+    s = api(f"{CONV_LIST}{cid}/session", token)
+    if "_error" in s:
+        return False
+    d = s.get("data", s)
+    link = d.get("link")
+    acp_token = d.get("token")
+    sid = d.get("sessionId")
+    if not (link and acp_token and sid):
+        log(f"{label} ACP 会话字段缺失: {list(d.keys())}")
+        return False
+    conn_id = acp_sse_get(link, acp_token)
+    if not conn_id:
+        return False
+    text = "早安，今日连续登录打卡完成（WorkBuddy 自动脚本）"
+    steps = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+         "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                    "clientInfo": {"name": "wb-checkin", "version": "1.0"}}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "prompt",
+         "params": {"sessionId": sid, "prompt": [{"type": "text", "text": text}], "_meta": {}}},
+    ]
+    ok = all(acp_post(link, acp_token, conn_id, p) for p in steps)
+    log(f"{label} 对话打卡已发往会话 {str(cid)[:12]}… {'✅' if ok else '⚠️'}")
+    return ok
 
 
 # ─── 查积分（客户端「可用积分」口径 = 当月周期剩余 CycleCapacityRemainPrecise 之和）───
@@ -312,6 +426,8 @@ def main():
         mode = "afternoon"
     else:
         mode = "morning"
+    # --chat 与日常例行合并执行（不互斥）：默认顺带早晨签到，配 --afternoon 则含下午领奖
+    chat = "--chat" in args
 
     accounts = load_tokens()
     if not accounts:
@@ -410,6 +526,9 @@ def main():
                 log(f"🎁 盲盒: code={rr.get('code')} msg={rr.get('msg')}")
             else:
                 log(f"能量 {e} < 10，跳过盲盒")
+
+        if chat:
+            chat_checkin_one(acc["token"], acc["label"])
 
         after = get_credits(acc["token"])
         if before >= 0 and after >= 0:

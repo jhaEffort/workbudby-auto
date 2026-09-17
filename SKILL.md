@@ -75,6 +75,10 @@ python3 scripts/auto_daily.py --query
 # 查积分使用概况：本月额度 / 已用 / 剩余 / 7 天内将失效 / 最近失效日期
 python3 scripts/auto_daily.py --usage
 
+# 连续登录对话打卡（ACP 直写云端会话，三账号统一；与当日例行合并，默认顺带签到）
+python3 scripts/auto_daily.py --chat
+python3 scripts/auto_daily.py --afternoon --chat   # 下午领奖 + 对话打卡
+
 # 只处理第 2 个账号
 python3 scripts/auto_daily.py --account 2
 
@@ -136,7 +140,13 @@ python3 scripts/auto_daily.py --account 小号
 - **积分口径**：客户端「可用积分」= 当月周期剩余 `CycleCapacityRemainPrecise` 之和，**不是**总剩余 `CapacityRemain`（后者会偏高几百）。脚本已统一用前者，缺失时依次回退 `CycleCapacityRemain` → `CapacityRemain`。筛选：`CapacityUnit == "credits"` 且 `Status == 0`。
 - **喵旅行时长**：80% 用满 4h（最高奖励），20% 随机 1–3h（接口允许范围内）。`depart` 响应的 `duration_hours` 不可靠（恒 0），真实时长以 `arrive_at` 反推为准。
 - **每日两次领奖**：上午派猫下午才回，所以早晨跑一次（领旧奖 + 派新），下午再跑一次 `--afternoon`（领新奖）。
-- **「连续登录」≠ 积分签到**：增长中心的「当前连续登录」需要当天产生一次真实对话才会记录，纯签到 API 不会增加它。那部分依赖 WorkBuddy Automation 或 ACP 对话写入，超出本技能脚本范围。
+- **「连续登录」≠ 积分签到**：增长中心的「当前连续登录」需要当天产生一次**真实对话**才会记录，纯签到 API 不会增加它。
+  **脚本已内置 `--chat` 用 ACP 协议直写云端会话来补这件事**（见下「连续登录对话打卡（ACP）」一节）。
+  原理：增长中心后端只对当日产生真实对话的账号自动 +1，没有任何可程序化打卡的 RPC；`--chat` 走 ACP（StreamableHTTP + SSE + JSON-RPC `prompt`）往该账号某个云端会话发一句打卡话，等价于当天产生了一次对话。
+  - **实测三账号链路均通**：`GET /console/as/conversations/{cid}/session` 换 ACP 专用 JWT → `GET {link}(SSE)` 取响应头 `Acp-Connection-Id` → `POST {link}` 发 `initialize`/`notifications/initialized`/`prompt` 三步 JSON-RPC（均 202 Accepted）。
+  - **⚠️ 是否计入连续登录仍需你次日核对**：早期为「待验证」项。5377 / 5728 在客户端**没有**每日对话 Automation，所以它们是干净验证样本——打卡次日打开增长中心看「当前连续登录」是否 +1 即可确认。
+  - **副作用（轻微）**：会在该账号某个云端会话里多一条「早安，今日连续登录打卡完成（WorkBuddy 自动脚本）」消息。创建专用空白打卡会话的 API 未开放，只能复用现有会话；挑选优先级：`name=="new conversation"` > 最近创建 > 第一个。
+  - 若某账号**从未在客户端发起过任何对话**（云端会话列表为空），`--chat` 会跳过该账号并提示「无云端会话，ACP 对话打卡不可用」——此时先去客户端随便聊一句即可。
 - **`travel/status` 不可靠，别用它判断"有没有待领"**：status 返回的是最近一条旅行记录，`state=arrived` + `letter` 有内容**不代表还没领**（实测领取后仍显示 arrived/letter）。
   唯一准的判断是**直接调用 `travel/claim`**：已领过会返回 `code=400 msg="no unclaimed travel"`（脚本提示「猫猫在家，无待领奖励」），可领才返回 `code=0`。
   → 排查漏领时直接跑 `--afternoon` 让脚本去 claim，不要靠 status 下结论（曾据此误判两个号"已领完"，实际各漏 +7 / +9）。
@@ -153,6 +163,32 @@ python3 scripts/auto_daily.py --account 小号
     系统扣减时优先扣最快到期的包，所以看到的剩余会是"离到期最远的那批"。
 - **签到接口返回在顶层**：`daily-checkin` 的结构是顶层 `code` / `msg`（如 `code=10001 msg="今天已签到，请明天再来"`），不是 `data.Response.Data`。token 失效是 HTTP 401，两者不要混淆。
 - **领取奖励后「可用积分」可能不变**：签到/喵旅行的奖励进累计池，而脚本读的是**当月周期剩余**额度，所以常见"领取 +9 但可用积分净变化 +0"。这不是失败，别误判成没领到。
+
+## 连续登录对话打卡（ACP）
+
+增长中心「当前连续登录」需要当天产生**真实对话**才 +1，且后端没有可程序化打卡的 RPC（app.asar 里 growth handlers 只注册了只读的 `growthGetBuddy`）。`--chat` 用 ACP 协议直写该账号的云端会话，等价于当天产生一次对话。
+
+**三步链路（均用 `Authorization: Bearer <accessToken>`，accessToken 与签到同款）：**
+
+1. `GET https://workbuddy.cn/console/as/conversations/{cid}/session`
+   → 返回 `data.{link, token, sessionId, cwd, expireAt}`。其中 `token` 是 **ACP 专用 JWT**（约 620 字符，`aud=sandbox-gateway`），`link` 形如 `https://65225-<id>.workbuddy.agentos-worker.net/acp` 或 `...e2b...cloudstudio.club/acp`。
+   `{cid}` 取自 `GET /console/as/conversations/` 列出的某个云端会话 id（该列表按当前 token 的 uid 隔离，看不到别的账号）。
+2. `GET {link}`，请求头 `Accept: text/event-stream`、`Authorization: Bearer <ACP_JWT>`
+   → 从**响应头**取 `Acp-Connection-Id`（服务端首次连接下发）。**只读 1 字节 body 即可，别读完整 SSE 流**。
+3. `POST {link}`，请求头 `Content-Type: application/json`、`Accept: application/json, text/event-stream`、`Acp-Connection-Id: <上一步取到的值>`、`Authorization: Bearer <ACP_JWT>`，按顺序发三步 JSON-RPC（均返回 `202 Accepted`）：
+   ```json
+   {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"wb-checkin","version":"1.0"}}}
+   {"jsonrpc":"2.0","method":"notifications/initialized"}
+   {"jsonrpc":"2.0","id":2,"method":"prompt","params":{"sessionId":"<data.sessionId>","prompt":[{"type":"text","text":"早安，今日连续登录打卡完成（WorkBuddy 自动脚本）"}],"_meta":{}}}
+   ```
+
+**已踩的坑（按此顺序排障）：**
+- ❌ 用 accessToken 直连 `*.agentos-worker.net/acp` → `401`。worker 只认 ACP 专用 JWT，必须走 `/session` 换。
+- ❌ `initialize` 请求 `Accept: text/event-stream` → `406 Not Acceptable`。改为 `application/json, text/event-stream`（两者都要）。
+- ❌ POST 不带 `Acp-Connection-Id` → `400 required`。必须先 `GET {link}` 从响应头取。
+- ❌ 创建专用空白打卡会话的 API 未开放（`POST /console/as/conversations/` 只回列表），只能复用现有云端会话。
+
+**保留 WorkBuddy 内置 Automation 作为兜底**：`--chat` 是服务端直写、不依赖客户端在线，比内置 Automation 更稳（后者调度偶发丢失，曾导致 8/22、8/23 断签）。两者可并存，当天产生一次对话即可。
 
 ## 跨平台与定时执行（让它真正"自动"）
 
@@ -197,15 +233,14 @@ schedules/
 ## 放到 GitHub 上跑（GitHub Actions，不依赖本地开机）
 
 本地定时再稳也怕关机、休眠、断网。想要「真正的无人值守」，可以把脚本推到 GitHub 用 Actions 每天定时执行。
-模板已备好：`schedules/github/checkin.yml`。
+**工作流已就绪于 `.github/workflows/checkin.yml`**（推到 GitHub 后 Actions 自动识别、无需再复制；`schedules/github/checkin.yml` 是同一份的模板副本）。面向同事的分发说明见仓库根目录 `README.md`。
 
 **步骤**
 
 1. 建仓库（**建议 private**，因为要用你的 token）：
    ```bash
    cd workbuddy-checkin-travel
-   cp schedules/github/gitignore.example .gitignore    # 务必先挡住 tokens.txt / *.info / backups
-   git init && git add . && git commit -m "init"
+   # .gitignore 已在仓库根目录，已挡住 tokens.txt / *.info / backups / logs，无需再建
    git remote add origin git@github.com:<你的账号>/<仓库名>.git
    git push -u origin main
    ```
@@ -220,7 +255,7 @@ schedules/
 - **GitHub 的 cron 会延迟**：高峰期可能晚 5–30 分钟触发，极偶尔整点跳过。签到这种不要求精确到秒的任务无所谓，别拿它做严格定时任务。
 - 仓库 **60 天没有任何提交/活动，schedule 会被自动停用**，偶尔去点一次 Run workflow 就行。
 - 私有仓库免费额度 2000 分钟/月，每次跑 10 秒左右，完全够用。
-- **做不到的部分**：Actions 只能签到 + 喵旅行；「增长中心连续登录」需要真实对话，云端替代不了。
+- **连续登录也能在云端补**：workflow 已默认带 `--chat`，两次例行都顺带用 ACP 直写云端会话做对话打卡，无需客户端在线。唯一前提是该账号有过至少一次云端会话（`GET /console/as/conversations/` 非空）——新号先在客户端随便聊一句即可。是否计入连续登录请以次日增长中心为准。
 
 ## 常见问题
 

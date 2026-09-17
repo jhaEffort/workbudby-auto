@@ -1,13 +1,22 @@
 # 推送到 GitHub 前，把下面这些文件挡在外面（改名成 .gitignore 生效）
 # 这些都属于「你自己的私密信息」，一旦提交就是公开泄露
 
-tokens.txt          # 账号 token，绝不能提交
-*.info              # 客户端登录态文件
-auth_cache/         # 登录态缓存
-backups/            # 数据库快照
-logs/               # 运行日志
+# 账号 token，绝不能提交
+tokens.txt
+
+# 客户端登录态文件
+*.info
+
+# 登录态缓存 / 数据库快照 / 运行日志
+auth_cache/
+backups/
+logs/
+
+# Python
 __pycache__/
 *.db
 *.db-wal
 *.db-shm
+
+# macOS
 .DS_Store
