@@ -49,6 +49,15 @@ def _post_json(url: str, payload: dict) -> bool:
         with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
             resp.read()
         return True
+    except urllib.error.HTTPError as e:
+        # 把状态码和返回体打出来，便于判断是不是「每日推送额度超限」
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")[:200]
+        except Exception:
+            pass
+        print(f"[notify] 推送被拒 HTTP {e.code}: {body}", file=sys.stderr)
+        return False
     except Exception as e:
         print(f"[notify] 推送失败: {e}", file=sys.stderr)
         return False
@@ -97,14 +106,17 @@ def notify(title: str, content: str) -> None:
 
     any_ok = False
     if sct:
-        any_ok = _send_wechat("serverchan", sct, title, content) or any_ok
-        print("[notify] 微信(Server酱/环境变量)推送完成", file=sys.stderr)
+        ok = _send_wechat("serverchan", sct, title, content)
+        print(f"[notify] 微信(Server酱/环境变量): {'成功' if ok else '失败'}", file=sys.stderr)
+        any_ok = ok or any_ok
     if pushplus:
-        any_ok = _send_wechat("pushplus", pushplus, title, content) or any_ok
-        print("[notify] 微信(PushPlus/环境变量)推送完成", file=sys.stderr)
+        ok = _send_wechat("pushplus", pushplus, title, content)
+        print(f"[notify] 微信(PushPlus/环境变量): {'成功' if ok else '失败'}", file=sys.stderr)
+        any_ok = ok or any_ok
     if not (sct or pushplus) and sendkey:
-        any_ok = _send_wechat(provider, sendkey, title, content) or any_ok
-        print("[notify] 微信(.notify.json)推送完成", file=sys.stderr)
+        ok = _send_wechat(provider, sendkey, title, content)
+        print(f"[notify] 微信(.notify.json): {'成功' if ok else '失败'}", file=sys.stderr)
+        any_ok = ok or any_ok
 
     smtp_host = os.environ.get("SMTP_HOST", em.get("smtp_host", "")).strip()
     smtp_user = os.environ.get("SMTP_USER", em.get("username", "")).strip()

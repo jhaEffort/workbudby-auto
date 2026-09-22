@@ -18,6 +18,14 @@ on:
           - auto
           - morning
           - afternoon
+      push:
+        description: '是否推送到微信（false = 只生成日报并打到日志，不消耗 Server酱 每日额度）'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
 
 permissions:
   contents: read
@@ -69,7 +77,7 @@ jobs:
           WB_TOKEN_3: ${{ secrets.WB_TOKEN_3 }}
         run: python scripts/auto_daily.py --check-expiry=7
 
-      - name: 执行每日任务 + 生成日报推送
+      - name: 执行每日任务 + 生成日报
         env:
           WB_TOKEN_1: ${{ secrets.WB_TOKEN_1 }}
           WB_TOKEN_2: ${{ secrets.WB_TOKEN_2 }}
@@ -77,8 +85,10 @@ jobs:
           # 微信推送（Server酱 sendkey）。不配置就不推送、只写日志，不影响任务本身。
           # 在仓库 Settings → Secrets and variables → Actions 里加 SCT_SENDKEY。
           # 也可以改用 PushPlus：加 PUSHPLUS_TOKEN 即可（两个都配会各推一次）。
+          # push=false（手动触发时可选）时不推送，只把日报打到日志，避免消耗每日推送额度。
           SCT_SENDKEY: ${{ secrets.SCT_SENDKEY }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          WB_NO_PUSH: ${{ github.event.inputs.push == 'false' && '1' || '' }}
         run: |
           python scripts/auto_daily.py ${{ steps.mode.outputs.arg }} 2>&1 | tee run.log
           python scripts/report.py run.log

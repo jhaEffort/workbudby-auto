@@ -37,7 +37,6 @@ def _parse_new(log_text: str) -> dict:
     cur = None
     # 账号分隔行形如：── 昵称(尾号) ──  或  ── [1/3] 昵称(尾号) ──（尾号是 3~4 位数字）
     acct_re = re.compile(r"──\s*(?:\[\d+/\d+\]\s*)?(.+?)──")
-    label_ok = re.compile(r"\(\d{3,4}\)")
 
     streak_re = re.compile(r"🔥\s*连续登录\s*(\d+)\s*天")
     before_re = re.compile(r"执行前积分:\s*([\d.]+)")
@@ -56,8 +55,9 @@ def _parse_new(log_text: str) -> dict:
 
     for line in log_text.splitlines():
         line = line.strip()
+        # 账号标签形如「昵称(尾号)」或 CI 里的「账号(WB_TOKEN_1)」——只要非空就认
         m = acct_re.search(line)
-        if m and label_ok.search(m.group(1)):
+        if m and m.group(1).strip():
             cur = m.group(1).strip()
             _ensure(accounts, cur)
             continue
