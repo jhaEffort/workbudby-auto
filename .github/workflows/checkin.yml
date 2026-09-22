@@ -8,6 +8,16 @@ on:
     - cron: '30 1 * * *'
     - cron: '0 6 * * *'
   workflow_dispatch:        # 允许在 Actions 页面手动点一下试跑
+    inputs:
+      mode:
+        description: '执行模式（auto = 按触发时间自动判断）'
+        required: false
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - morning
+          - afternoon
 
 permissions:
   contents: read
@@ -29,11 +39,19 @@ jobs:
       - name: 选择执行模式
         id: mode
         run: |
-          HOUR=$(date -u +%H)
-          if [ "$HOUR" -lt 4 ]; then
+          # 手动触发时可用 inputs.mode 强制指定；默认按 UTC 时间自动判断
+          INPUT="${{ github.event.inputs.mode }}"
+          if [ "$INPUT" = "morning" ]; then
             echo "arg=--all" >> "$GITHUB_OUTPUT"
-          else
+          elif [ "$INPUT" = "afternoon" ]; then
             echo "arg=--afternoon --chat" >> "$GITHUB_OUTPUT"
+          else
+            HOUR=$(date -u +%H)
+            if [ "$HOUR" -lt 4 ]; then
+              echo "arg=--all" >> "$GITHUB_OUTPUT"
+            else
+              echo "arg=--afternoon --chat" >> "$GITHUB_OUTPUT"
+            fi
           fi
 
       # token 只能从 Secrets 读，千万不要写进代码或 tokens.txt 提交上去。
