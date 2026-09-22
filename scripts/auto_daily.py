@@ -4,6 +4,16 @@
 跨平台：仅依赖 Python 3 标准库，macOS / Windows / Linux 通用；Windows 上命令用 python 而非 python3。
 
 不内置任何登录信息。首次使用需提供【你自己的】accessToken：
+
+Token 有效期：accessToken 实测为**固定 60 天**（签发日 +60d），不是长期凭证。
+  每次运行都会打印该账号 token 的剩余天数；剩余 <7 天会高亮提醒，过期后需重新导出。
+  定时任务（cron / GitHub Actions）务必留意这一点，否则会静默失效。
+
+⚠️ **CI（GitHub Actions）无法自己续期**：云端容器里没有桌面端登录态，而 OAuth
+  refresh 需要客户端密钥（拿不到，见 refresh_tokens.py 的说明）。
+  所以 CI 侧的 token 必须由**装了桌面端的机器**定期推送更新（见 refresh_tokens.py
+  --push-github），CI 自己则用 `--check-expiry` 做提前告警：
+  有 token 临近过期就让工作流失败，GitHub 会发邮件提醒你。
   A. 环境变量单账号： export WB_TOKEN=<你的token>
   B. 多账号：当前目录建 tokens.txt：
        # WB_TOKEN_1 = 我的主账号
@@ -16,7 +26,16 @@
   python3 auto_daily.py --afternoon   # 下午领奖（上午派出的猫回来了）
   python3 auto_daily.py --query       # 只查积分
   python3 auto_daily.py --usage       # 查积分使用概况（额度/已用/剩余/临近失效）
-  python3 auto_daily.py --chat        # 连续登录对话打卡（ACP 直写云端会话，三账号统一）
+  python3 auto_daily.py --chat        # 连续登录对话打卡（WebChat 直写真实会话，三账号统一）
+  python3 auto_daily.py --chat=5      # 对话打卡 5 次（成长任务「和AI聊天N次」用，注意消耗额度）
+  python3 auto_daily.py --tasks       # 成长任务：接受 + 查看进度 + 领取奖励
+  python3 auto_daily.py --lottery     # 抽奖（自动查剩余次数并抽完）
+  python3 auto_daily.py --redeem      # 按连续登录档位兑换奖励（7d/14d/28d）
+  python3 auto_daily.py --makeup      # 用补签卡补今天（连续登录断签兜底）
+  python3 auto_daily.py --makeup=2026-09-20  # 补签指定日期
+  python3 auto_daily.py --all         # 早晨例行 + 对话打卡 + 成长任务 + 抽奖 + 兑换
+  python3 auto_daily.py --check-expiry      # 只体检 token 有效期，<7 天则以退出码 1 告警
+  python3 auto_daily.py --check-expiry=14   # 阈值改为 14 天
   python3 auto_daily.py --list        # 列出已配置的账号（含序号与标签）
   python3 auto_daily.py --account 2   # 只处理第 2 个账号（按序号）
   python3 auto_daily.py --account 1234   # 只处理标签里含 1234 的账号（按关键字切换）
@@ -30,27 +49,29 @@
 
 说明：
   - 每个账号独立处理，互不影响；某个账号 token 失效只会单独报错，不中断其他账号。
-  - 「连续登录」的对话打卡是另一回事（需真实对话/ACP），用独立的 --chat 子命令做。
+  - 「连续登录」的对话打卡是另一回事（需真实对话），用独立的 --chat 子命令做（WebChat 通道）。
 
 --chat 说明（连续登录对话打卡）：
-  增长中心「连续登录」没有可程序化打卡的接口，后端只对当日产生「真实对话」的账号自动 +1。
-  本模式用 ACP 协议（StreamableHTTP + SSE + JSON-RPC prompt）直写该账号的云端会话：
-    1) GET /console/as/conversations/{cid}/session  换 ACP 专用 JWT + worker link + sessionId
-    2) GET {link}(SSE) 从响应头取 Acp-Connection-Id
-    3) POST {link} 发 initialize / notifications/initialized / prompt 三步（均 202）
-  实测三账号均可用，但「是否计入连续登录」需次日打开增长中心核对（早期为待验证项）。
-  副作用：会在该账号某个云端会话里多一条打卡消息（复用现有会话，创建专用会话的 API 未开放）。
+  增长中心「连续登录」后端只对当日产生「真实对话」的账号自动 +1。
+  本模式用前端同款 WebChat 通道（纯 token，不依赖客户端在线）直写该账号的真实云端会话：
+    1) POST /console/webchat/conversations      新建真实会话，拿 conversationId
+    2) POST /console/chat/completions           发消息 + 取真实 AI 回复（SSE 流）
+    3) POST /v2/report 发 chat_request_send / chat_request_response 遥测
+  三账号统一走这条路径，「是否计入连续登录」仍需次日打开增长中心核对（建议连续观察 2~3 天）。
 """
 import json
 import sys
 import os
 import time
 import random
+import base64
+import uuid
 import urllib.request
 import urllib.error
-from datetime import datetime
+from datetime import datetime, date
 
 API = "https://www.codebuddy.cn"
+WEB = "https://www.workbuddy.cn"   # 对话/遥测通道（与计费 API 不同 host）
 EP = {
     "checkin": f"{API}/v2/billing/meter/daily-checkin",
     "resource": f"{API}/v2/billing/meter/get-user-resource",
@@ -96,108 +117,294 @@ def api(url: str, token: str, method: str = "GET", body=None) -> dict:
         return {"_error": str(e)}
 
 
-# ─── 连续登录对话打卡（ACP 协议直写云端会话，不依赖客户端在线）────────────
-# 增长中心「连续登录」没有可程序化打卡的接口，后端只对当日产生「真实对话」的账号自动 +1。
-# 唯一的纯服务端路径是 ACP（StreamableHTTP + SSE + JSON-RPC prompt）：
-#   1) GET /console/as/conversations/{cid}/session  -> 换 ACP 专用 JWT + worker link + sessionId
-#   2) GET {link}(SSE) 取响应头 Acp-Connection-Id
-#   3) POST {link} 发 initialize / notifications/initialized / prompt 三步 JSON-RPC（均 202）
-# 注意：复用现有云端会话（创建专用会话的 API 未开放），会在该会话里多一条打卡消息。
-ACP_HOST = "https://workbuddy.cn"
-CONV_LIST = f"{ACP_HOST}/console/as/conversations/"
-
-
-def acp_sse_get(link: str, acp_token: str) -> str:
-    """GET link(SSE)，从响应头取 Acp-Connection-Id。不读 body。"""
-    req = urllib.request.Request(link, headers={
-        "Authorization": f"Bearer {acp_token}",
-        "Accept": "text/event-stream",
-        "User-Agent": "WorkBuddy-Desktop",
-    }, method="GET")
+# ─── 连续登录对话打卡（WebChat 通道：纯 token 直写真实云端会话，不依赖客户端在线）────
+# 增长中心「连续登录」后端只对当日产生「真实对话」的账号自动 +1。
+# 早先用 ACP(/console/as/conversations) 直写：长期未活跃账号的会话全是 completed，
+#   worker 收下(202)但不落库、不计连续登录；且 POST 创建会话是 403（无权限）——此路已死。
+# 现改用前端同款 WebChat 通道（参考社区签到脚本 v21~v23，纯 token 可靠）：
+#   1) POST /console/webchat/conversations      -> 新建真实会话，拿 conversationId
+#   2) POST /console/chat/completions          -> 发消息 + 取真实 AI 回复（SSE 流）
+#   3) POST /v2/report 发 chat_request_send / chat_request_response 遥测
+# 三个账号统一走这条 token 路径，无需客户端在线，可 CI。
+def jwt_sub(token: str) -> str:
+    """从 Bearer JWT 中段解出 sub（user_id），供遥测 userId 字段使用。"""
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-            cid = resp.headers.get("Acp-Connection-Id")
-            try:
-                resp.read(1)
-            except Exception:
-                pass
-            return cid or ""
-    except urllib.error.HTTPError as e:
-        if e.code == 401:
-            log("ACP: token 失效(401)，请刷新 accessToken")
-        else:
-            log(f"ACP SSE GET HTTP {e.code}")
-        return ""
-    except Exception as e:
-        log(f"ACP SSE GET 失败: {e}")
+        import base64
+        parts = token.split(".")
+        if len(parts) < 2:
+            return ""
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload))
+        return data.get("sub", "") or ""
+    except Exception:
         return ""
 
 
-def acp_post(link: str, acp_token: str, conn_id: str, payload: dict) -> bool:
-    req = urllib.request.Request(link, headers={
-        "Authorization": f"Bearer {acp_token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/event-stream",
-        "Acp-Connection-Id": conn_id or "",
-        "User-Agent": "WorkBuddy-Desktop",
-    }, data=json.dumps(payload).encode(), method="POST")
+def jwt_exp(token: str) -> int:
+    """从 Bearer JWT 解出 exp（过期时间戳，秒）；无 exp 字段返回 0。"""
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-            return resp.status in (200, 202)
+        parts = token.split(".")
+        if len(parts) < 2:
+            return 0
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        return int(json.loads(base64.urlsafe_b64decode(payload)).get("exp") or 0)
+    except Exception:
+        return 0
+
+
+def token_expiry_note(token: str, label: str = ""):
+    """打印 token 剩余有效期；临近过期(<7 天)或已过期时高亮提醒。
+
+    accessToken 实测固定 60 天有效期（签发日 +60d），到期后需重新导出，
+    所以每次运行都报一下剩余天数，避免定时任务静默失效。
+    """
+    exp = jwt_exp(token)
+    if not exp:
+        log(f"{label} 🔐 token 无 exp 字段（长效/未知）")
+        return
+    days = (exp - time.time()) / 86400
+    until = datetime.fromtimestamp(exp).strftime("%Y-%m-%d")
+    if days <= 0:
+        log(f"{label} 🔴 token 已过期（{until}），请重新导出！")
+    elif days < 7:
+        log(f"{label} 🟠 token 仅剩 {days:.1f} 天（{until} 到期），请尽快重新导出")
+    else:
+        log(f"{label} 🔐 token 剩余 {days:.0f} 天（{until} 到期）")
+
+
+def _sse_collect(url: str, headers: dict, body: dict, timeout: int = 60) -> str:
+    """POST 并逐行读 SSE 流，拼出 AI 回复文本。"""
+    req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                 headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            text = ""
+            for raw in resp:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                chunk = line[5:].strip()
+                if chunk in ("[✅完成]", "[DONE]"):
+                    continue
+                try:
+                    d = json.loads(chunk)
+                except Exception:
+                    continue
+                for c in d.get("choices", []):
+                    cp = c.get("delta", {}).get("content", "")
+                    if cp:
+                        text += cp
+            return text
     except urllib.error.HTTPError as e:
-        log(f"ACP POST {payload.get('method')} HTTP {e.code}: {e.read().decode(errors='replace')[:200]}")
-        return False
+        log(f"WebChat HTTP {e.code}: {e.read().decode(errors='replace')[:120]}")
+        return ""
     except Exception as e:
-        log(f"ACP POST {payload.get('method')} 失败: {e}")
-        return False
+        log(f"WebChat 失败: {e}")
+        return ""
 
 
-def pick_conversation(token: str):
-    """列出云端会话，挑一个写入打卡消息：优先 'new conversation'，否则最近创建，否则第一个。"""
-    r = api(CONV_LIST, token)
-    if "_error" in r:
-        return None
-    convs = (r.get("data") or {}).get("conversations", [])
-    if not convs:
-        return None
-    target = next((c for c in convs if c.get("name") == "new conversation"), None)
-    if target is None:
-        target = max(convs, key=lambda c: c.get("createdAt", 0)) or convs[0]
-    return target
+CHAT_PROMPTS = [
+    "早安，请直接回复一句「今日连续登录打卡完成」即可。",
+    "你好，请简单介绍一下你自己",
+    "今天天气怎么样？",
+    "1+1等于几？请直接回答",
+    "Python是什么？一句话回答",
+    "请说再见",
+    "写一首关于春天的诗",
+    "如何学习编程？",
+    "推荐一本好书",
+    "解释一下什么是云计算",
+]
 
 
-def chat_checkin_one(token: str, label: str = "") -> bool:
-    """对一个账号做 ACP 对话打卡，返回是否成功发出 prompt。"""
-    conv = pick_conversation(token)
-    if not conv:
-        log(f"{label} 无云端会话，ACP 对话打卡不可用（需先在客户端发起过一次对话）")
-        return False
-    cid = conv.get("id")
-    s = api(f"{CONV_LIST}{cid}/session", token)
-    if "_error" in s:
-        return False
-    d = s.get("data", s)
-    link = d.get("link")
-    acp_token = d.get("token")
-    sid = d.get("sessionId")
-    if not (link and acp_token and sid):
-        log(f"{label} ACP 会话字段缺失: {list(d.keys())}")
-        return False
-    conn_id = acp_sse_get(link, acp_token)
-    if not conn_id:
-        return False
-    text = "早安，今日连续登录打卡完成（WorkBuddy 自动脚本）"
-    steps = [
-        {"jsonrpc": "2.0", "id": 1, "method": "initialize",
-         "params": {"protocolVersion": "2024-11-05", "capabilities": {},
-                    "clientInfo": {"name": "wb-checkin", "version": "1.0"}}},
-        {"jsonrpc": "2.0", "method": "notifications/initialized"},
-        {"jsonrpc": "2.0", "id": 2, "method": "prompt",
-         "params": {"sessionId": sid, "prompt": [{"type": "text", "text": text}], "_meta": {}}},
-    ]
-    ok = all(acp_post(link, acp_token, conn_id, p) for p in steps)
-    log(f"{label} 对话打卡已发往会话 {str(cid)[:12]}… {'✅' if ok else '⚠️'}")
+def chat_checkin_one(token: str, label: str = "", count: int = 1) -> int:
+    """对一个账号做连续登录对话打卡（WebChat 通道，纯 token，不依赖客户端）。
+
+    每次都在账号名下新建一个真实云端会话并发生成式对话，后端据此给「连续登录」+1；
+    成长任务类「和AI聊天N次」需要多轮时用 --chat=N（每轮独立会话，更接近真实行为）。
+    返回成功对话数。
+    注意：真实对话会消耗模型额度，日常续登用默认 1 次即可。
+    """
+    uid = jwt_sub(token)
+    if not uid:
+        log(f"{label} ⚠️ 无法从 token 解析 userId，遥测将缺 userId")
+    hdr = {"Authorization": f"Bearer {token}", "Content-Type": "application/json",
+           "Accept": "text/event-stream", "Referer": f"{WEB}/chat/",
+           "Origin": WEB, "User-Agent": "Mozilla/5.0"}
+    ok = 0
+    for i in range(count):
+        prompt = CHAT_PROMPTS[i % len(CHAT_PROMPTS)]
+        r = api(f"{WEB}/console/webchat/conversations", token, "POST",
+                {"name": f"wb-checkin-{uuid.uuid4().hex[:12]}"})
+        conv_id = (r.get("data") or {}).get("conversationId", "")
+        if not conv_id:
+            log(f"{label} WebChat 创建会话失败({i+1}/{count}): {str(r)[:120]}")
+            continue
+        resp = _sse_collect(f"{WEB}/console/chat/completions", hdr,
+                            {"messages": [{"role": "user", "content": prompt}],
+                             "model": "glm-5.2", "stream": True, "conversationId": conv_id})
+        rid = f"cmb-{uuid.uuid4().hex}"
+        now = int(time.time() * 1000)
+        events = [
+            {"eventCode": "chat_request_send", "timestamp": now - 2000, "reportDelay": 0,
+             "expKeys": "", "ideName": "sdk", "machineId": uuid.uuid4().hex, "userId": uid,
+             "mode": "ask", "conversationId": conv_id, "requestId": rid,
+             "requestModelId": "glm-5.2", "requestModelName": "glm-5.2",
+             "inputLength": len(prompt), "customAgentName": ""},
+            {"eventCode": "chat_request_response", "timestamp": now, "reportDelay": 0,
+             "expKeys": "", "ideName": "sdk", "machineId": uuid.uuid4().hex, "userId": uid,
+             "mode": "ask", "conversationId": conv_id, "requestId": rid,
+             "requestModelId": "glm-5.2", "requestModelName": "glm-5.2", "toolCallCount": 0,
+             "inputToken": max(1, len(prompt) // 4),
+             "outputToken": max(1, len(resp) // 4) if resp else 1,
+             "totalToken": max(2, (len(prompt) + len(resp)) // 4)},
+        ]
+        tr = api(f"{WEB}/v2/report", token, "POST", events)
+        good = bool(resp) and tr.get("code") == 0
+        if good:
+            ok += 1
+        log(f"{label} 对话 {i+1}/{count} 会话={conv_id[:12]}… 回复={'有' if resp else '无'}"
+            f"({len(resp)}字) 遥测={'✅' if tr.get('code') == 0 else '⚠️' + str(tr.get('code'))}")
+        if i < count - 1:
+            time.sleep(random.uniform(2, 5))
+    log(f"{label} 对话打卡完成: {ok}/{count} " + ("✅" if ok == count else "⚠️"))
     return ok
+
+
+# ─── 成长中心：连续签到 / 成长任务 / 抽奖 / 连登兑换 / 补签卡 ──────────────
+# 端点均走网页端 host（WEB），与计费 API（API）不同域。
+GR = {
+    "streak": f"{WEB}/v2/activity/growth/streak",
+    "tasks": f"{WEB}/v2/activity/growth/tasks",
+    "accept": f"{WEB}/v2/activity/growth/tasks/accept",
+    "claim": f"{WEB}/v2/activity/growth/tasks/",          # + {code} + /claim
+    "lottery_chances": f"{WEB}/v2/activity/growth/lottery/chances",
+    "lottery_draw": f"{WEB}/v2/activity/growth/lottery/draw",
+    "redeem": f"{WEB}/v2/activity/growth/redeem",
+    "makeup": f"{WEB}/v2/activity/growth/makeup-cards/use",
+}
+
+
+def get_streak(token: str) -> dict:
+    """连续登录天数等信息；失败返回 {}。"""
+    r = api(GR["streak"], token)
+    if "_error" in r or r.get("code") not in (0, None):
+        return {}
+    return (r.get("data") or {}).get("streak", {}) or {}
+
+
+def do_makeup(token: str, label: str, target: str = ""):
+    """补签卡：补回断签的那天，连续登录天数可续上（账号需有补签卡）。"""
+    if not target:
+        target = date.today().strftime("%Y-%m-%d")
+    r = api(GR["makeup"], token, "POST", {"target_date": target})
+    code = r.get("code", r.get("_error", -1))
+    msg = str(r.get("msg", r.get("message", "")))
+    if code == 0:
+        log(f"{label} 🎫 补签成功 {target} {msg}")
+    else:
+        log(f"{label} 🎫 补签 {target}: code={code} msg={msg}")
+
+
+def do_lottery(token: str, label: str):
+    """抽奖：先查剩余次数，有多少抽多少。"""
+    c = api(GR["lottery_chances"], token)
+    d = c.get("data") or {}
+    raw = d.get("balance", d.get("chances", d.get("remaining")))
+    if raw is None:
+        log(f"{label} 🎰 抽奖次数查询失败/无字段: {str(c)[:120]}")
+        return
+    chances = int(raw)
+    if chances <= 0:
+        log(f"{label} 🎰 无抽奖次数（{chances}）")
+        return
+    log(f"{label} 🎰 剩余抽奖次数 {chances}，开始抽…")
+    for i in range(chances):
+        r = api(GR["lottery_draw"], token, "POST", {"client_token": uuid.uuid4().hex})
+        code = r.get("code", r.get("_error", -1))
+        rd = r.get("data") or {}
+        prize = rd.get("name") or rd.get("prize") or r.get("msg", "")
+        log(f"{label} 🎰 第 {i+1} 抽: code={code} {str(prize)[:60]}")
+        time.sleep(random.uniform(1, 3))
+
+
+def do_redeem(token: str, label: str):
+    """按连续登录档位兑换奖励（7d/14d/28d）；已兑换(409)/天数不足(403)自动跳过。"""
+    days = int(get_streak(token).get("days", 0))
+    log(f"{label} 🎁 连续登录 {days} 天")
+    for tier, need in (("7d", 7), ("14d", 14), ("28d", 28)):
+        if days < need:
+            log(f"{label} 🎁 档位 {tier} 需 {need} 天，跳过")
+            continue
+        r = api(GR["redeem"], token, "POST",
+                {"tier": tier, "client_token": uuid.uuid4().hex})
+        code = r.get("code", r.get("_error", -1))
+        if code == 0:
+            d = r.get("data") or {}
+            log(f"{label} 🎁 兑换 {tier} 成功! +{d.get('credit_granted', 0)} 积分 "
+                f"+{d.get('energy_granted', 0)} 能量 +{d.get('chances_granted', 0)} 抽奖")
+        else:
+            log(f"{label} 🎁 兑换 {tier}: code={code} msg={str(r.get('msg', ''))[:60]}")
+        time.sleep(1)
+
+
+def do_growth_tasks(token: str, label: str):
+    """成长任务：接受 → 查看进度 → 领取已达成的。动态读取，不硬编码任务码。
+
+    说明：纯对话类任务（如「和AI聊天5次」）依赖 --chat=N 产生真实对话来推进，
+    本函数只负责接受与领取；其余靠遥测推进的任务在 --chat 之外另行处理。
+    """
+    r = api(GR["tasks"], token)
+    if "_error" in r:
+        log(f"{label} 📋 成长任务查询失败")
+        return
+    data = r.get("data") or {}
+    tasks = data.get("tasks") or data.get("list") or []
+    if not tasks:
+        log(f"{label} 📋 无成长任务（响应 keys={list(data.keys())}）")
+        return
+
+    # 1) 批量接受尚未接受的任务（注意是 task_codes 数组，不是 task_code 单数）
+    todo = [t.get("task_code") for t in tasks
+            if t.get("task_code") and t.get("accept_status") not in ("accepted", "claimed")]
+    if todo:
+        ar = api(GR["accept"], token, "POST", {"task_codes": todo})
+        log(f"{label} 📋 接受任务 {len(todo)} 个: code={ar.get('code')} {str(ar.get('msg',''))[:60]}")
+    else:
+        log(f"{label} 📋 任务均已接受过")
+
+    # 2) 重新拉取进度，逐个领取已达成的
+    time.sleep(2)
+    r2 = api(GR["tasks"], token)
+    tasks2 = (r2.get("data") or {}).get("tasks") or tasks
+    got = 0
+    for t in tasks2:
+        code = t.get("task_code")
+        if not code:
+            continue
+        name = t.get("title") or code
+        prog = t.get("progress") or {}
+        cur, tgt = prog.get("current", 0), prog.get("target", 0)
+        st = t.get("accept_status", "")     # accepted（进行中）/ claimed（已领取）
+        reward = t.get("reward_credit", 0)
+        if st == "claimed":
+            log(f"  ✅ {name} 已领取 (+{reward})")
+            continue
+        if tgt and cur >= tgt:
+            cr = api(GR["claim"] + code + "/claim", token, "POST", {})
+            c = cr.get("code", cr.get("_error", -1))
+            m = str(cr.get("msg", ""))
+            if c == 0:
+                got += 1
+                log(f"  🎉 {name} 达成 {cur}/{tgt} → 领取成功 +{reward} 积分")
+            elif "已" in m or c == 10001:
+                log(f"  📌 {name} 已领取过")
+            else:
+                log(f"  ⚠️ {name} 领取: code={c} msg={m[:50]}")
+            time.sleep(1)
+        else:
+            log(f"  ·  {name} {cur}/{tgt} (+{reward} 积分)")
+    log(f"{label} 📋 本轮领取 {got} 个任务奖励")
 
 
 # ─── 查积分（客户端「可用积分」口径 = 当月周期剩余 CycleCapacityRemainPrecise 之和）───
@@ -412,11 +619,12 @@ def load_tokens() -> list:
 
 
 def main():
-    args = set(a for a in sys.argv[1:] if not a.startswith("--account"))
+    argv = sys.argv[1:]
     sel = None   # --account 的原始值：数字=序号，其它=标签关键字
-    for i, a in enumerate(sys.argv):
-        if a == "--account" and i + 1 < len(sys.argv):
-            sel = sys.argv[i + 1]
+    for i, a in enumerate(argv):
+        if a == "--account" and i + 1 < len(argv):
+            sel = argv[i + 1]
+    args = [a for a in argv if a != "--account" and a != sel]
 
     if "--query" in args:
         mode = "query"
@@ -426,8 +634,37 @@ def main():
         mode = "afternoon"
     else:
         mode = "morning"
+
+    # 子开关解析：支持 --name 与 --name=值 两种写法
+    def _flag(name):
+        for a in args:
+            if a == name:
+                return True, None
+            if a.startswith(name + "="):
+                return True, a.split("=", 1)[1].strip()
+        return False, None
+
     # --chat 与日常例行合并执行（不互斥）：默认顺带早晨签到，配 --afternoon 则含下午领奖
-    chat = "--chat" in args
+    has_chat, chat_val = _flag("--chat")
+    chat_count = 1
+    if has_chat and chat_val:
+        try:
+            chat_count = max(1, min(int(chat_val), 20))
+        except ValueError:
+            chat_count = 1
+    has_tasks, _ = _flag("--tasks")
+    has_lottery, _ = _flag("--lottery")
+    has_redeem, _ = _flag("--redeem")
+    has_makeup, makeup_val = _flag("--makeup")
+    has_check, check_val = _flag("--check-expiry")
+    check_days = 7
+    if check_val:
+        try:
+            check_days = max(1, int(check_val))
+        except ValueError:
+            pass
+    if "--all" in args:
+        has_chat, has_tasks, has_lottery, has_redeem = True, True, True, True
 
     accounts = load_tokens()
     if not accounts:
@@ -482,9 +719,35 @@ def main():
             sys.exit(1)
         accounts = picked
 
+    # ── --check-expiry：只体检 token 有效期，不执行任何业务 ──
+    # 用途：CI（GitHub Actions）没有桌面端登录态、也无法自己续期，
+    # 用它做「提前告警」——有 token 临近过期就以非 0 退出，
+    # GitHub 会给失败的定时任务发邮件，等于零配置的提醒。
+    if has_check:
+        bad = 0
+        for acc in accounts:
+            exp = jwt_exp(acc["token"])
+            days = (exp - time.time()) / 86400 if exp else -1
+            until = datetime.fromtimestamp(exp).strftime("%Y-%m-%d") if exp else "-"
+            if days < 0:
+                log(f"🔴 {acc['label']} token 已过期（{until}）")
+                bad += 1
+            elif days < check_days:
+                log(f"🟠 {acc['label']} token 仅剩 {days:.1f} 天（{until} 到期）")
+                bad += 1
+            else:
+                log(f"🔐 {acc['label']} token 剩余 {days:.0f} 天（{until} 到期）")
+        if bad:
+            log(f"❌ {bad} 个账号的 token 将在 {check_days} 天内过期，"
+                f"请更新 GitHub Secrets / tokens.txt 后重跑")
+            sys.exit(1)
+        log(f"✅ 所有 token 剩余有效期 > {check_days} 天")
+        return
+
     log(f"WorkBuddy 自动日常（{mode}）共 {len(accounts)} 个账号")
     for acc in accounts:
         log(f"── {acc['label']} ──")
+        token_expiry_note(acc["token"], acc["label"])
         if mode == "usage":
             u = get_usage(acc["token"])
             if not u:
@@ -502,6 +765,11 @@ def main():
         before = get_credits(acc["token"])
         if before >= 0:
             log(f"📊 执行前积分: {before}")
+
+        # 连续登录天数（只读，供 report.py 生成日报时展示）
+        _st = get_streak(acc["token"])
+        if _st:
+            log(f"🔥 连续登录 {_st.get('days', 0)} 天")
 
         if mode == "morning":
             r = do_checkin(acc["token"])
@@ -527,8 +795,16 @@ def main():
             else:
                 log(f"能量 {e} < 10，跳过盲盒")
 
-        if chat:
-            chat_checkin_one(acc["token"], acc["label"])
+        if has_chat:
+            chat_checkin_one(acc["token"], acc["label"], chat_count)
+        if has_tasks:
+            do_growth_tasks(acc["token"], acc["label"])
+        if has_lottery:
+            do_lottery(acc["token"], acc["label"])
+        if has_redeem:
+            do_redeem(acc["token"], acc["label"])
+        if has_makeup:
+            do_makeup(acc["token"], acc["label"], makeup_val or "")
 
         after = get_credits(acc["token"])
         if before >= 0 and after >= 0:

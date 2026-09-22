@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.workbuddy.daily</string>
+
+    <!-- 合并版单一入口：run_daily.sh 按当前时间自动选模式
+         09:30 → auto_daily.py --all             （签到+领旧奖+派猫+对话打卡+成长任务+抽奖+兑换）
+         14:00 → auto_daily.py --afternoon --chat（领奖 + 再补一次对话打卡）
+         跑完由 report.py 生成日报，经 notify.py 推送微信。 -->
+
+    <!-- 替换占位符：__PYTHON__ / __SCRIPT_DIR__ / __WORK_DIR__ -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__SCRIPT_DIR__/run_daily.sh</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHON</key>
+        <string>__PYTHON__</string>
+    </dict>
+
+    <!-- 必须切到放 tokens.txt 的目录，否则读不到 token -->
+    <key>WorkingDirectory</key>
+    <string>__WORK_DIR__</string>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>9</integer>
+            <key>Minute</key>
+            <integer>30</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>14</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>__WORK_DIR__/logs/daily.log</string>
+    <key>StandardErrorPath</key>
+    <string>__WORK_DIR__/logs/daily.err</string>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

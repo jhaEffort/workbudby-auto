@@ -1,0 +1,108 @@
+#!/bin/bash
+# 提交前隐私自检 —— 拦截任何可能含个人信息的提交
+#
+# 启用方式（每人 clone 后执行一次）：
+#   git config core.hooksPath .githooks
+#
+# 拦截内容：
+#   1) JWT / accessToken（eyJ 开头、带 . 分段的长串）
+#   2) 中国大陆手机号（1 开头 11 位）
+#   3) 真实家目录路径（/Users/xxx/、/home/xxx/）
+#   4) Server酱 sendkey（SCT 开头长串、或 sendkey=xxx 明文赋值）
+#   5) 敏感文件被提交（tokens.txt / *.info / .notify.json / refresh_store.json
+#                      / privacy-tails.local）
+#   6) 你自己的账号尾号（从 .githooks/privacy-tails.local 读，该文件不进仓库）
+#
+# 误报处理：在 .githooks/privacy-allowlist 加「文件路径:正则」豁免。
+# 紧急情况（你确认安全时）：git commit --no-verify
+
+set -uo pipefail
+
+RED='\033[0;31m'; YEL='\033[0;33m'; GRN='\033[0;32m'; NC='\033[0m'
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# ── 检测规则：正则|说明 ──
+RULES=(
+  'eyJ[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{15,}|JWT / accessToken'
+  '1[3-9][0-9]{9}|中国大陆手机号'
+  '/Users/[a-z][A-Za-z0-9._-]*/|macOS 真实家目录路径'
+  '/home/[a-z][A-Za-z0-9._-]*/|Linux 真实家目录路径'
+  'SCT[A-Za-z0-9]{20,}|Server酱 sendkey'
+  'sendkey["'"'"' ]*[:=][ ]*["'"'"']?[A-Za-z0-9]{16,}|明文 sendkey 赋值'
+)
+
+# ── 不该被提交的文件 ──
+BAD_NAMES=('tokens.txt' '.notify.json' 'refresh_store.json' 'privacy-tails.local')
+BAD_GLOBS=('*.info')
+
+ALLOWLIST="$HOOK_DIR/privacy-allowlist"
+TAILS_FILE="$HOOK_DIR/privacy-tails.local"
+
+files=$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null)
+[ -z "$files" ] && exit 0
+
+fail=0
+report() { echo -e "${RED}✖ 拦截${NC} $1 — $2:"; echo "$3" | sed 's/^/      /'; }
+
+# ── 1) 敏感文件名 ──
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+  base=$(basename "$f")
+  for b in "${BAD_NAMES[@]}"; do
+    [ "$base" = "$b" ] && { echo -e "${RED}✖ 拦截${NC} 敏感文件被提交: $f"; fail=1; }
+  done
+  for g in "${BAD_GLOBS[@]}"; do
+    [[ "$base" == $g ]] && { echo -e "${RED}✖ 拦截${NC} 登录态文件被提交: $f"; fail=1; }
+  done
+done <<< "$files"
+
+# ── 2) 你自己的账号尾号（本地文件，不进仓库）──
+TAILS=()
+if [ -f "$TAILS_FILE" ]; then
+  while IFS= read -r t; do
+    t="$(echo "$t" | tr -d '[:space:]')"
+    [ -n "$t" ] && [[ "$t" =~ ^[0-9]{3,4}$ ]] && TAILS+=("$t")
+  done < "$TAILS_FILE"
+fi
+
+# ── 3) 内容扫描 ──
+while IFS= read -r f; do
+  [ -z "$f" ] || [ ! -f "$f" ] && continue
+  # 跳过钩子自身（它的说明文档里必然写着示例路径，属误报）
+  case "$f" in .githooks/*) continue ;; esac
+
+  for rule in "${RULES[@]}"; do
+    pat="${rule%%|*}"; desc="${rule##*|}"
+    hits=$(grep -nE "$pat" "$f" 2>/dev/null | head -3)
+    [ -z "$hits" ] && continue
+    if [ -f "$ALLOWLIST" ]; then
+      while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        [[ "$f" == "${line%%:*}" ]] && echo "$hits" | grep -qE "${line#*:}" && { hits=""; break; }
+      done < "$ALLOWLIST"
+    fi
+    [ -z "$hits" ] && continue
+    report "$f" "疑似${desc}" "$hits"
+    fail=1
+  done
+
+  # 自己的尾号（命中即拦，不做 allowlist 豁免）
+  for t in "${TAILS[@]:-}"; do
+    [ -z "$t" ] && continue
+    hits=$(grep -nE "[一-龥A-Za-z]（?\(${t}\)|\(${t}\)" "$f" 2>/dev/null | head -3)
+    [ -z "$hits" ] && continue
+    report "$f" "出现你的账号尾号 ${t}" "$hits"
+    fail=1
+  done
+done <<< "$files"
+
+if [ "$fail" -ne 0 ]; then
+  echo ""
+  echo -e "${YEL}提交已阻止。${NC}请删除个人信息后重试。"
+  echo "确认为误报？在 .githooks/privacy-allowlist 加一行「文件路径:正则」豁免。"
+  echo "（紧急且你确认安全时可用 git commit --no-verify，但不建议）"
+  exit 1
+fi
+
+echo -e "${GRN}✔ 隐私自检通过${NC}（无 token / 手机号 / 家目录 / 密钥 / 敏感文件）"
+exit 0

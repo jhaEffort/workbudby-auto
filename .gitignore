@@ -7,10 +7,20 @@ tokens.txt
 # 客户端登录态文件
 *.info
 
+# 推送配置（含 Server酱 sendkey 等密钥）
+# 注意：注释必须独占一行，写成 `tokens.txt  # 注释` 会让整行变成匹配模式导致规则失效
+.notify.json
+
+# 隐私钩子用的本机账号尾号（pre-commit 也会拦，双保险）
+.githooks/privacy-tails.local
+
 # 登录态缓存 / 数据库快照 / 运行日志
 auth_cache/
 backups/
 logs/
+run.log
+daily.log
+daily_bonus.log
 
 # Python
 __pycache__/
