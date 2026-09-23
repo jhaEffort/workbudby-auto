@@ -117,7 +117,14 @@ def _parse_new(log_text: str) -> dict:
             acc["redeem"].setdefault("dup", []).append(r.group(1)); continue
         r = redeem_skip_re.search(line)
         if r:
-            acc["redeem"].setdefault("skip", []).append(f"{r.group(1)}(需{r.group(2)}天)"); continue
+            tier, need = r.group(1), int(r.group(2))
+            days = acc["redeem"].get("days")
+            if days is not None:
+                left = max(need - days, 0)
+                acc["redeem"].setdefault("skip", []).append(f"{tier}(还差{left}天)")
+            else:
+                acc["redeem"].setdefault("skip", []).append(f"{tier}(需{need}天)")
+            continue
 
         # 喵旅行细节
         if "✅ 领取成功" in line and "积分" in line:
@@ -247,14 +254,14 @@ def _travel_desc(t: dict) -> str:
 
 def _redeem_desc(r: dict) -> str:
     parts = []
+    if r.get("days") is not None:
+        parts.append(f"连登 {r['days']} 天")
     if r.get("ok"):
         parts.append("兑换成功 " + "/".join(r["ok"]))
     if r.get("dup"):
         parts.append("本月已兑换 " + "/".join(r["dup"]))
     if r.get("skip"):
         parts.append("未达 " + "/".join(r["skip"]))
-    if r.get("days") is not None and not parts:
-        parts.append(f"连登 {r['days']} 天")
     return " · ".join(parts) if parts else None
 
 
