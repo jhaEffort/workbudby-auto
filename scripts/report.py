@@ -52,6 +52,11 @@ def _parse_new(log_text: str) -> dict:
     redeem_ok_re = re.compile(r"🎁\s*兑换\s*(\w+)\s*成功")
     redeem_skip_re = re.compile(r"🎁\s*档位\s*(\w+)\s*需\s*(\d+)\s*天")
     redeem_done_re = re.compile(r"🎁\s*兑换\s*(\w+).*?已兑换")
+    # 补签卡（--makeup / --makeup-auto）
+    makeup_auto_hdr_re = re.compile(r"🎫\s*自动补签：卡\s*(\d+)\s*张\s*/\s*缺口\s*(\d+)\s*天\s*/\s*当前\s*(\d+)\s*天\s*→\s*补至\s*(\w+)")
+    makeup_auto_done_re = re.compile(r"🎫\s*自动补签完成：消耗\s*(\d+)\s*张，连续登录升至\s*(\d+)\s*天")
+    makeup_ok_re = re.compile(r"🎫\s*补签成功\s*(\S+)")
+    makeup_fail_re = re.compile(r"🎫\s*补签\s*(\S+):\s*code=")
 
     for line in log_text.splitlines():
         line = line.strip()
@@ -125,6 +130,34 @@ def _parse_new(log_text: str) -> dict:
             else:
                 acc["redeem"].setdefault("skip", []).append(f"{tier}(需{need}天)")
             continue
+
+        # 补签卡
+        r = makeup_auto_hdr_re.search(line)
+        if r:
+            acc.setdefault("makeup", {})["auto"] = True
+            acc["makeup"]["cards"] = int(r.group(1))
+            acc["makeup"]["gaps"] = int(r.group(2))
+            acc["makeup"]["days"] = int(r.group(3))
+            acc["makeup"]["tier"] = r.group(4)
+            continue
+        r = makeup_auto_done_re.search(line)
+        if r:
+            acc.setdefault("makeup", {})["auto"] = True
+            acc["makeup"]["used"] = int(r.group(1))
+            acc["makeup"]["final_days"] = int(r.group(2))
+            continue
+        if "🎫 自动补签：" in line:
+            acc.setdefault("makeup", {})["auto"] = True
+            acc["makeup"]["skip"] = line.split("自动补签：", 1)[1].strip()
+            continue
+        r = makeup_ok_re.search(line)
+        if r:
+            mk = acc.setdefault("makeup", {})
+            mk.setdefault("success", []).append(r.group(1)); continue
+        r = makeup_fail_re.search(line)
+        if r:
+            acc.setdefault("makeup", {})["manual"] = True
+            acc["makeup"].setdefault("fail", []).append(r.group(1)); continue
 
         # 喵旅行细节
         if "✅ 领取成功" in line and "积分" in line:
@@ -265,6 +298,21 @@ def _redeem_desc(r: dict) -> str:
     return " · ".join(parts) if parts else None
 
 
+def _makeup_desc(r: dict) -> str:
+    if r.get("skip"):
+        return f"🎫 自动补签：{r['skip']}"
+    if r.get("used") is not None:
+        used, fd = r["used"], r.get("final_days", "?")
+        gaps = r.get("gaps", "?")
+        rem = (gaps - used) if isinstance(gaps, int) and isinstance(used, int) else "?"
+        return f"🎫 自动补签用 {used} 张，连续登录升至 {fd} 天（缺口 {gaps} 天，余 {rem}）"
+    if r.get("success"):
+        return "🎫 补签成功 " + " / ".join(r["success"])
+    if r.get("fail"):
+        return "🎫 补签未成功 " + " / ".join(r["fail"])
+    return None
+
+
 def _render(accounts: dict) -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = [f"📋 WorkBuddy 积分日报", f"🕐 {now}", ""]
@@ -345,6 +393,17 @@ def _render(accounts: dict) -> str:
         for label, d in descs:
             lines.append("")
             lines.append(f"• {label}：🎁 {d}")
+        lines.append("")
+
+    # 6.5) 补签卡
+    rows = [(l, a.get("makeup", {})) for l, a in accounts.items() if a.get("makeup")]
+    descs = [(l, _makeup_desc(r)) for l, r in rows]
+    descs = [(l, d) for l, d in descs if d]
+    if descs:
+        lines.append("【补签卡】")
+        for label, d in descs:
+            lines.append("")
+            lines.append(f"• {label}：{d}")
         lines.append("")
 
     # 7) Token 有效期

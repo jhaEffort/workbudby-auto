@@ -33,7 +33,9 @@ Token 有效期：accessToken 实测为**固定 60 天**（签发日 +60d），�
   python3 auto_daily.py --redeem      # 按连续登录档位兑换奖励（7d/14d/28d）
   python3 auto_daily.py --makeup      # 用补签卡补今天（连续登录断签兜底）
   python3 auto_daily.py --makeup=2026-09-20  # 补签指定日期
-  python3 auto_daily.py --all         # 早晨例行 + 对话打卡 + 成长任务 + 抽奖 + 兑换
+  python3 auto_daily.py --makeup-auto # 智能自动补签：有卡+有断签缺口+能更近达标时才用（已并入 --all）
+  python3 auto_daily.py --makeup-auto=28d    # 目标档位（默认 28d，可选 7d/14d/28d）
+  python3 auto_daily.py --all         # 早晨例行 + 对话打卡 + 成长任务 + 抽奖 + 自动补签 + 兑换
   python3 auto_daily.py --check-expiry      # 只体检 token 有效期，<7 天则以退出码 1 告警
   python3 auto_daily.py --check-expiry=14   # 阈值改为 14 天
   python3 auto_daily.py --list        # 列出已配置的账号（含序号与标签）
@@ -304,6 +306,64 @@ def do_makeup(token: str, label: str, target: str = ""):
         log(f"{label} 🎫 补签成功 {target} {msg}")
     else:
         log(f"{label} 🎫 补签 {target}: code={code} msg={msg}")
+
+
+def do_makeup_auto(token: str, label: str, target_tier: str = "28d"):
+    """自动补签（智能兜底）。
+
+    对齐用户要求：『当前有补卡 + 还不满足达标 → 自动用补卡完成达标任务』。
+    规则（护栏，避免浪费补签卡）：
+      - 仅当账号【当前有补签卡】且【存在断签缺口 makeup_dates】时才动手；
+      - 逐日补齐最早的缺口，使连续登录天数尽量逼近/达到目标档位（默认冲 28d 档）；
+      - 每补一张卡即重读连续天数，卡用光或天数已达标即停；
+      - 无任何缺口（只是天数还不够、但连续没断）时【绝不】消耗补签卡——
+        这种情况必须靠后续真实签到累积，补签卡补不了未来/已签到的日子。
+    随后由调用方的 do_redeem 领取因此解锁的档位奖励。
+    """
+    r = api(GR["streak"], token)
+    if "_error" in r or r.get("code") not in (0, None):
+        log(f"{label} 🎫 自动补签：查询连续登录失败，跳过")
+        return
+    data = r.get("data") or {}
+    st = data.get("streak", {}) or {}
+    cards = int((data.get("makeup_cards") or {}).get("balance", 0))
+    gaps = st.get("makeup_dates") or []
+    days = int(st.get("days", 0))
+    tier_map = {"7d": 7, "14d": 14, "28d": 28}
+    tier_days = tier_map.get(target_tier, 28)
+
+    if cards <= 0:
+        log(f"{label} 🎫 自动补签：无补签卡，跳过")
+        return
+    if not gaps:
+        log(f"{label} 🎫 自动补签：连续 {days} 天且无断签缺口，补签卡保留待命（不浪费）")
+        return
+    if days >= tier_days:
+        log(f"{label} 🎫 自动补签：已达 {target_tier} 档（{days} 天），无需补签")
+        return
+
+    log(f"{label} 🎫 自动补签：卡 {cards} 张 / 缺口 {len(gaps)} 天 / 当前 {days} 天 → 补至 {target_tier} 档")
+    used = 0
+    for g in sorted(gaps):
+        if used >= cards or days >= tier_days:
+            break
+        mr = api(GR["makeup"], token, "POST", {"target_date": g})
+        code = mr.get("code", mr.get("_error", -1))
+        msg = str(mr.get("msg", mr.get("message", "")))
+        if code == 0:
+            used += 1
+            log(f"{label} 🎫 补签成功 {g}（第 {used}/{cards} 张）{msg}")
+            st2 = (api(GR["streak"], token).get("data") or {}).get("streak", {}) or {}
+            new_days = int(st2.get("days", days))
+            if new_days > days:
+                days = new_days
+            time.sleep(1)
+        else:
+            log(f"{label} 🎫 补签 {g} 不可补: code={code} msg={msg[:60]}")
+    if used:
+        log(f"{label} 🎫 自动补签完成：消耗 {used} 张，连续登录升至 {days} 天")
+    else:
+        log(f"{label} 🎫 自动补签：缺口均不可补（非断签日），未消耗补签卡")
 
 
 def do_lottery(token: str, label: str):
@@ -656,6 +716,8 @@ def main():
     has_lottery, _ = _flag("--lottery")
     has_redeem, _ = _flag("--redeem")
     has_makeup, makeup_val = _flag("--makeup")
+    has_makeup_auto, makeup_tier_val = _flag("--makeup-auto")
+    makeup_tier = makeup_tier_val or "28d"
     has_check, check_val = _flag("--check-expiry")
     check_days = 7
     if check_val:
@@ -664,7 +726,7 @@ def main():
         except ValueError:
             pass
     if "--all" in args:
-        has_chat, has_tasks, has_lottery, has_redeem = True, True, True, True
+        has_chat, has_tasks, has_lottery, has_redeem, has_makeup_auto = True, True, True, True, True
 
     accounts = load_tokens()
     if not accounts:
@@ -801,10 +863,12 @@ def main():
             do_growth_tasks(acc["token"], acc["label"])
         if has_lottery:
             do_lottery(acc["token"], acc["label"])
-        if has_redeem:
-            do_redeem(acc["token"], acc["label"])
+        if has_makeup_auto:
+            do_makeup_auto(acc["token"], acc["label"], makeup_tier)
         if has_makeup:
             do_makeup(acc["token"], acc["label"], makeup_val or "")
+        if has_redeem:
+            do_redeem(acc["token"], acc["label"])
 
         after = get_credits(acc["token"])
         if before >= 0 and after >= 0:
