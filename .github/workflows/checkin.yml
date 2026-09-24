@@ -1,11 +1,11 @@
 name: WorkBuddy Daily Checkin
 
 # GitHub Actions 用的是 UTC 时间，换算关系：北京时间 - 8 小时 = UTC
-#   北京时间 09:30（早晨：签到 + 领旧奖 + 派猫）→ UTC 01:30
+#   北京时间 06:00（早晨：签到 + 领旧奖 + 派猫）→ UTC 22:00（前一天）
 #   北京时间 14:00（下午：领奖）              → UTC 06:00
 on:
   schedule:
-    - cron: '30 1 * * *'
+    - cron: '0 22 * * *'
     - cron: '0 6 * * *'
   workflow_dispatch:        # 允许在 Actions 页面手动点一下试跑
     inputs:
@@ -40,22 +40,22 @@ jobs:
         with:
           python-version: '3.11'
 
-      # 同一个 workflow 里区分早晨 / 下午：UTC 01:30 跑早晨例行，UTC 06:00 跑下午领奖
-      # 早晨：--all = 签到 + 领旧奖 + 派猫 + 对话打卡 + 成长任务 + 抽奖 + 连登兑换
-      # 下午：--afternoon --chat = 领奖 + 再补一次对话打卡
+      # 按【北京时间】区分早晨 / 下午：
+      #   北京 06:00–11:59 → 早晨：--all（签到 + 领旧奖 + 派猫 + 对话打卡 + 成长任务 + 抽奖 + 连登兑换）
+      #   其余时段         → 下午：--afternoon --chat（领奖 + 再补一次对话打卡）
       # 对话打卡走 WebChat 通道（纯 token 建真实会话），不依赖客户端在线，CI 可直接跑
       - name: 选择执行模式
         id: mode
         run: |
-          # 手动触发时可用 inputs.mode 强制指定；默认按 UTC 时间自动判断
+          # 手动触发时可用 inputs.mode 强制指定；默认按北京时间自动判断
           INPUT="${{ github.event.inputs.mode }}"
           if [ "$INPUT" = "morning" ]; then
             echo "arg=--all" >> "$GITHUB_OUTPUT"
           elif [ "$INPUT" = "afternoon" ]; then
             echo "arg=--afternoon --chat" >> "$GITHUB_OUTPUT"
           else
-            HOUR=$(date -u +%H)
-            if [ "$HOUR" -lt 4 ]; then
+            BEIJING_HOUR=$(( ($(date -u +%H) + 8) % 24 ))
+            if [ "$BEIJING_HOUR" -ge 6 ] && [ "$BEIJING_HOUR" -lt 12 ]; then
               echo "arg=--all" >> "$GITHUB_OUTPUT"
             else
               echo "arg=--afternoon --chat" >> "$GITHUB_OUTPUT"
