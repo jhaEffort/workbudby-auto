@@ -88,7 +88,7 @@ jobs:
           WB_TOKEN_3: ${{ secrets.WB_TOKEN_3 }}
           WB_TOKEN_4: ${{ secrets.WB_TOKEN_4 }}
           WB_TOKEN_5: ${{ secrets.WB_TOKEN_5 }}
-        run: python scripts/auto_daily.py --check-expiry=7
+        run: python scripts/auto_daily.py --check-expiry=3
 
       - name: 执行每日任务 + 生成日报
         env:
