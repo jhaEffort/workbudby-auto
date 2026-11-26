@@ -82,6 +82,9 @@ jobs:
       #    GitHub 会给失败的定时任务发邮件 —— 等于零配置的到期提醒。
       #    真正续期由装了桌面端的机器执行：refresh_tokens.py --push-github=owner/repo
       - name: 检查 token 有效期
+        # 只做告警：某账号 token 临近/已经过期时不再中断 job，
+        # 保证其余账号照常签到（脚本逐账号独立，单个 401 不影响别人）。
+        continue-on-error: true
         env:
           WB_TOKEN_1: ${{ secrets.WB_TOKEN_1 }}
           WB_TOKEN_2: ${{ secrets.WB_TOKEN_2 }}
